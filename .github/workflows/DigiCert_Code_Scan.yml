@@ -7,10 +7,23 @@ jobs:
   analyze:
     name: Analyze (${{ matrix.language }})
     runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+
+    permissions:
+      # required for all workflows
+      security-events: write
+
+      # required to fetch internal or private CodeQL packs
+      packages: read
+
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+
     strategy:
       fail-fast: false
       matrix:
         include:
+          # - This will be replaced with the generated language and build mode content on runtime
           - language: Java
             build-mode: none
           - language: JavaScript
@@ -19,6 +32,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Initializes the CodeQL tools for scanning.
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
@@ -27,7 +41,7 @@ jobs:
 
       - name: Perform CodeQL Analysis
         uses: github/codeql-action/analyze@v3
-        with:
+        with:   
           category: '/language:${{matrix.language}}'
           upload: false
           output: "codeql-${{ matrix.language }}.sarif"
@@ -37,7 +51,7 @@ jobs:
         with:
           name: codeql-sarif-${{ matrix.language }}
           path: codeql-${{ matrix.language }}.sarif
-          
+
   gitleaks-analyze:
     name: Gitleaks Scan (SARIF)
     runs-on: ubuntu-latest
@@ -52,25 +66,39 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y jq
 
-      - name: Install gitleaks (OSS)
+      - name: Download Gitleaks and verify checksum
         env:
           GITLEAKS_VERSION: 8.18.4
         run: |
-          set -e
-          curl -fsSL -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
-          tar -xzf gitleaks.tar.gz
-          test -f gitleaks && chmod +x gitleaks && sudo mv gitleaks /usr/local/bin/gitleaks
+          curl -sSL -o gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          curl -sSL -o checksums.txt https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_checksums.txt
+          grep "gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" checksums.txt | sha256sum -c -
+          tar -xzf gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz
+          chmod +x gitleaks && sudo mv gitleaks /usr/local/bin/gitleaks
           gitleaks version
 
       - name: Run Gitleaks (SARIF output)
         run: |
+          echo "Scanning commit: $(git rev-parse HEAD)"
+
+          SCAN_DIR=$(mktemp -d)
+          trap 'rm -rf "$SCAN_DIR"' EXIT
+
+          git archive HEAD | tar -x -C "$SCAN_DIR"
+
           gitleaks detect \
-            --source . \
+            --source "$SCAN_DIR" \
             --report-format sarif \
             --report-path gitleaks.sarif \
             --no-banner \
             --redact \
             --no-git || true
+
+          echo "Findings: $(jq '.runs[0].results | length' gitleaks.sarif)"
+
+          jq -r '.runs[0].results[]? |
+            "\(.ruleId) \(.locations[0].physicalLocation.artifactLocation.uri):\(.locations[0].physicalLocation.region.startLine)"' \
+            gitleaks.sarif || true
 
       - name: Upload Gitleaks SARIF as artifact
         uses: actions/upload-artifact@v4
@@ -86,6 +114,7 @@ jobs:
       - name: Download all SARIF artifacts
         uses: actions/download-artifact@v4
         with:
+          # Grab both codeql and gitleaks SARIF artifacts for zipping
           pattern: "*-sarif*"
           path: ./sarif-results
           merge-multiple: true
@@ -93,8 +122,8 @@ jobs:
       - name: Zip SARIF results
         run: |
           cd sarif-results
-          find . -name "*.sarif" -print | zip ../codeql-sarif-results.zip -@
-          
+          find . -name "*.sarif" -print | zip ../digicert_scan_results.zip -@
+      
       - name: Delete all SARIF files after zipping
         run: |
           find ./sarif-results -name "*.sarif" -delete
@@ -102,5 +131,26 @@ jobs:
       - name: Upload zipped SARIF results as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: codeql-sarif-results
-          path: codeql-sarif-results.zip
+          name: digicert_scan_results
+          path: digicert_scan_results.zip
+  
+  sbom:
+    name: Generate SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy to generate SBOM
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          format: 'cyclonedx'
+          output: 'sbom-cdxgen.cyclonedx.json'
+      
+      - name: Upload SBOM as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cdxgen
+          path: |
+            sbom-cdxgen.cyclonedx.json
